@@ -6,19 +6,13 @@ from fuzzywuzzy import fuzz
 import os
 
 # === CONFIGURATION ===
-img_path = 'images/12.jpeg'  # Input image path
-output_dir = 'output'
-font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'  # Adjust for your system
-
-# === OCR SETUP ===
+input_folder = 'images'
+output_folder = 'output'
+font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+confidence_threshold = 0.7
 ocr = PaddleOCR(use_angle_cls=True, lang='en', det_db_score_mode='fast', layout=True)
 
-# === Load image ===
-image = cv2.imread(img_path)
-if image is None:
-    raise FileNotFoundError(f"🚫 Image not found at {img_path}")
-
-# --- IoU FUNCTION ---
+# === UTILS ===
 def compute_iou(box1, box2):
     box1 = np.array(box1).reshape(-1, 2)
     box2 = np.array(box2).reshape(-1, 2)
@@ -36,22 +30,20 @@ def compute_iou(box1, box2):
     union_area = box1_area + box2_area - inter_area
     return inter_area / union_area if union_area > 0 else 0
 
-# --- TEXT SIMILARITY CHECK ---
 def is_similar(text1, text2, threshold=85):
     return fuzz.ratio(text1.strip().lower(), text2.strip().lower()) >= threshold
 
-# --- MULTIPLE PREPROCESSORS ---
 def preprocess_variants(img):
-    variants = [img]  # Original
+    variants = [img]
 
-    # Variant 1: Adaptive threshold
+    # Variant 1: Adaptive Threshold
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                      cv2.THRESH_BINARY, 11, 2)
     adaptive_bgr = cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR)
     variants.append(adaptive_bgr)
 
-    # Variant 2: Bilateral + Morph + Gamma correction
+    # Variant 2: Bilateral + Morph + Gamma
     bilateral = cv2.bilateralFilter(adaptive_bgr, 9, 75, 75)
     morph = cv2.morphologyEx(bilateral, cv2.MORPH_CLOSE, np.ones((1, 1), np.uint8))
     gamma = 1.5
@@ -62,47 +54,59 @@ def preprocess_variants(img):
 
     return variants
 
-# --- GET OCR RESULTS FROM MULTIPLE VERSIONS ---
-all_results = []
-for variant in preprocess_variants(image):
-    result = ocr.ocr(variant, cls=True)[0]
-    if result:
-        all_results.extend(result)
+# === MAIN LOOP ===
+os.makedirs(output_folder, exist_ok=True)
 
-# --- SMART DEDUPLICATION (Text + Box IoU) ---
-final_results = []
-for box, (text, score) in sorted(all_results, key=lambda x: x[1][1], reverse=True):
-    matched = False
-    for i, (existing_box, (existing_text, existing_score)) in enumerate(final_results):
-        if is_similar(text, existing_text) and compute_iou(box, existing_box) > 0.5:
-            matched = True
-            if score > existing_score:
-                final_results[i] = (box, (text, score))
-            break
-    if not matched:
-        final_results.append((box, (text, score)))
+for i in range(1, 13):
+    filename = f"{i}.jpeg"
+    img_path = os.path.join(input_folder, filename)
+    image = cv2.imread(img_path)
 
-# --- Print OCR results ---
-print("\n🔍 OCR Results (deduplicated):")
-for box, (text, confidence) in final_results:
-    print(f'Text: {text} | Confidence: {confidence:.2f}')
+    if image is None:
+        print(f"⚠️ Skipping missing image: {img_path}")
+        continue
 
-# --- Draw results ---
-boxes = [item[0] for item in final_results]
-txts = [item[1][0] for item in final_results]
-scores = [item[1][1] for item in final_results]
+    print(f"\n📷 Processing: {filename}")
 
-image_with_boxes = draw_ocr(image, boxes, txts, scores, font_path=font_path)
+    # Get OCR results from all variants
+    all_results = []
+    for variant in preprocess_variants(image):
+        result = ocr.ocr(variant, cls=True)[0]
+        if result:
+            all_results.extend(result)
 
-# --- Save output ---
-os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, os.path.basename(img_path))
-cv2.imwrite(output_path, image_with_boxes)
-print(f'\n📸 Output image saved to: {output_path}')
+    # Deduplicate + Filter
+    deduped = []
+    for new_box, (new_text, new_score) in sorted(all_results, key=lambda x: x[1][1], reverse=True):
+        if new_score < confidence_threshold:
+            continue
+        keep = True
+        for box, (text, score) in deduped:
+            if is_similar(new_text, text) and compute_iou(new_box, box) > 0.5:
+                keep = False
+                break
+        if keep:
+            deduped.append((new_box, (new_text, new_score)))
 
-# --- Show result in Matplotlib ---
-img_rgb = cv2.cvtColor(image_with_boxes, cv2.COLOR_BGR2RGB)
-plt.imshow(img_rgb)
-plt.axis('off')
-plt.title("Smart Ensemble OCR 🧠")
-plt.show()
+    # Display OCR results
+    print("🔍 Final OCR Results:")
+    for box, (text, score) in deduped:
+        print(f"Text: {text} | Confidence: {score:.2f}")
+
+    # Draw results
+    boxes = [b for b, _ in deduped]
+    txts = [t[0] for _, t in deduped]
+    scores = [t[1] for _, t in deduped]
+    image_with_boxes = draw_ocr(image, boxes, txts, scores, font_path=font_path)
+
+    # Save output image
+    output_path = os.path.join(output_folder, filename)
+    cv2.imwrite(output_path, image_with_boxes)
+    print(f"✅ Saved to: {output_path}")
+
+    # Optional display
+    img_rgb = cv2.cvtColor(image_with_boxes, cv2.COLOR_BGR2RGB)
+    plt.imshow(img_rgb)
+    plt.axis('off')
+    plt.title(f"Smart OCR: {filename}")
+    plt.show()
