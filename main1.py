@@ -10,12 +10,24 @@ output_folder = 'output'
 font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 confidence_threshold = 0.7
 
-# Initialize PaddleOCR v2.7+ with SVTR_LCNet recognizer and DBNet detector
-ocr = PaddleOCR(
+# Ensemble recognizers: SVTR_LCNet and CRNN (both supported in PaddleOCR v2.7+)
+ocr_svtr = PaddleOCR(
     use_angle_cls=True,
     lang='en',
-    rec_algorithm='SVTR_LCNet',  # SVTR_LCNet is valid (not just 'SVTR')
-    det_algorithm='DB',          # DBNet detector
+    rec_algorithm='SVTR_LCNet',
+    det_algorithm='DB',
+    det_db_score_mode='fast',
+    det_db_unclip_ratio=1.7,
+    det_db_box_thresh=0.5,
+    rec_batch_num=6,
+    use_dilation=True,
+    layout=True
+)
+ocr_crnn = PaddleOCR(
+    use_angle_cls=True,
+    lang='en',
+    rec_algorithm='CRNN',
+    det_algorithm='DB',
     det_db_score_mode='fast',
     det_db_unclip_ratio=1.7,
     det_db_box_thresh=0.5,
@@ -60,10 +72,33 @@ def is_similar(text1, text2, threshold=85):
         return True
     return fuzz.ratio(text1.lower(), text2.lower()) >= threshold
 
-def preprocess_image(img):
-    # L1: Grayscale
+def deskew_image(img):
+    """Deskew image using moments for better OCR accuracy."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # CLAHE for local contrast enhancement
+    coords = np.column_stack(np.where(gray < 255))
+    if coords.shape[0] < 10:
+        return img  # Not enough content to deskew
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    (h, w) = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def preprocess_image(img):
+    """
+    Returns a list of (description, processed_image) tuples,
+    including all preprocessing layers.
+    """
+    layers = []
+    # L0: Deskewed image (BGR)
+    deskewed = deskew_image(img)
+    layers.append(("Deskewed", deskewed.copy()))
+    # L1: Grayscale + CLAHE
+    gray = cv2.cvtColor(deskewed, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     gray = clahe.apply(gray)
     # L2: Gamma correction
@@ -76,7 +111,6 @@ def preprocess_image(img):
     table2 = np.array([(i / 255.0) ** invGamma2 * 255 for i in range(256)]).astype("uint8")
     gamma_img2 = cv2.LUT(gray, table2)
     kernel = np.ones((3, 3), np.uint8)
-    results = []
     for gamma_img, gamma_val in [(gamma_img1, 1.5), (gamma_img2, 0.8)]:
         # L3: Adaptive thresholding
         adaptive_thresh = cv2.adaptiveThreshold(
@@ -85,18 +119,20 @@ def preprocess_image(img):
         )
         # L4: Morphological closing
         morph_closing = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
-        # L5: Noise reduction
+        # L5: Noise reduction (median, gaussian, bilateral)
         median_filtered = cv2.medianBlur(morph_closing, 3)
-        results.append(("Median-γ=" + str(gamma_val), median_filtered))
+        layers.append(("Median-γ=" + str(gamma_val), cv2.cvtColor(median_filtered, cv2.COLOR_GRAY2BGR)))
         gaussian_filtered = cv2.GaussianBlur(morph_closing, (3, 3), 0)
-        results.append(("Gaussian-γ=" + str(gamma_val), gaussian_filtered))
+        layers.append(("Gaussian-γ=" + str(gamma_val), cv2.cvtColor(gaussian_filtered, cv2.COLOR_GRAY2BGR)))
+        # L5b: Bilateral filter (edge-preserving smoothing)
+        bilateral_filtered = cv2.bilateralFilter(morph_closing, 9, 75, 75)
+        layers.append(("Bilateral-γ=" + str(gamma_val), cv2.cvtColor(bilateral_filtered, cv2.COLOR_GRAY2BGR)))
         # L6: Otsu's thresholding (optional)
         _, otsu_thresh = cv2.threshold(gamma_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         otsu_closed = cv2.morphologyEx(otsu_thresh, cv2.MORPH_CLOSE, kernel)
         otsu_filtered = cv2.medianBlur(otsu_closed, 3)
-        results.append(("Otsu-γ=" + str(gamma_val), otsu_filtered))
-    processed_images = [(name, cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)) for name, img in results]
-    return processed_images
+        layers.append(("Otsu-γ=" + str(gamma_val), cv2.cvtColor(otsu_filtered, cv2.COLOR_GRAY2BGR)))
+    return layers
 
 def update_results(new_results, existing_results):
     if not new_results:
@@ -117,6 +153,19 @@ def update_results(new_results, existing_results):
             existing_results.append((box, (text, score)))
     return existing_results
 
+def ensemble_ocr(img, description):
+    """Run both SVTR_LCNet and CRNN recognizers, merge results."""
+    results = []
+    for ocr_engine, tag in [(ocr_svtr, "SVTR_LCNet"), (ocr_crnn, "CRNN")]:
+        try:
+            ocr_result = ocr_engine.ocr(img, cls=True)
+            layer_results = ocr_result[0] if ocr_result else []
+            print(f"  [{tag}] Found {len(layer_results)} detections")
+            results.extend(layer_results)
+        except Exception as e:
+            print(f"OCR failed on {description} [{tag}]: {e}")
+    return results
+
 def main():
     os.makedirs(output_folder, exist_ok=True)
     for i in range(1, 13):
@@ -128,22 +177,13 @@ def main():
             continue
         print(f"\n🔍 Processing: {filename}")
         results = []
-        def safe_ocr_run(img, description):
-            print(f"🔹 OCR Layer: {description}")
-            try:
-                ocr_result = ocr.ocr(img, cls=True)
-                layer_results = ocr_result[0] if ocr_result else []
-                print(f"  Found {len(layer_results)} initial detections")
-                return layer_results
-            except Exception as e:
-                print(f"OCR failed on {description}: {e}")
-                return []
-        # Run OCR on original image
-        results = update_results(safe_ocr_run(original_image, "Raw Image"), results)
-        # Preprocessing pipeline
+        # Run ensemble OCR on raw image (Layer 0)
+        results = update_results(ensemble_ocr(original_image, "Raw Image"), results)
+        # Preprocessing pipeline (deskewed, filtered, etc.)
         processed_images = preprocess_image(original_image)
         for desc, img in processed_images:
-            results = update_results(safe_ocr_run(img, desc), results)
+            print(f"🔹 OCR Layer: {desc}")
+            results = update_results(ensemble_ocr(img, desc), results)
         # Filter for 7-segment display specifics
         filtered_results = []
         for box, (text, score) in results:
@@ -169,7 +209,7 @@ def main():
             plt.figure(figsize=(10, 8))
             plt.imshow(img_rgb)
             plt.axis('off')
-            plt.title(f"SVTR_LCNet+DBNet OCR: {filename}")
+            plt.title(f"Ensemble OCR: {filename}")
             plt.show()
         else:
             print("⚠️ No valid OCR results found.")
